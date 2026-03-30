@@ -11,3 +11,5 @@ Sistem, 2021 yılından bu yana olan süreç içerisinde takip edilen uzay çöp
 
 
 Arayüz ortamı HTML ve CSS dilleri kullanılarak tasarlandı. Arayüz gerçek zamanlı olarak dünya saati ve eksen hareketleri baz alınarak hesaplandı.  Sol panel uydulardan, sağ panel ise uydulara basıldığında bu uyduların eksenindeki çöplerin isimlerinden oluşuyor. Çarpışmayı göster tuşuna basarak uydu ile çöpün çarpışma ihtimali bulunan konuma hareketleri simüle edilir. Bu simülasyon hızı ayarlanabilir ve gerektiğinde durdurulabilir. Eğer uydu ve çöpün çarpışma durumu bulunursa sistem uyarı vererek uydunun yapması gereken hareketin miktarı ve yönelme miktarı en az yakıt harcaması gerçekleştirilecek şekilde hesaplanır. Ardından bu uyarı ana merkeze gönderilebilir. Merkez panelde simülasyon görseli bulunur ve bütün animasyon ve görüntüler burada oluşur. 📸 
+
+Projeyi çalıştırmak için bulunduğu klasör terminaline girip "python -m http.server 8000" yazdıktan "http://localhost:8000/index.html" adresini tarayıcınız URL'sine giriniz. Çalışmalarınızda başarılar :).
