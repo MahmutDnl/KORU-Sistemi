@@ -1,0 +1,4 @@
+Senaryo_No,Tarih_Saat,Uydu_Adi,Risk_Olasılığı_%,Risk_Seviyesi,Yukseklik_Fark_km,Mesafe_Etkinlik_Sn,Manevra_Tipi,Mevcut_Hiz_km_s,Hedef_Hiz_km_s,Hiz_Degisim_km_s,Hedef_Yukseklik_km,Manevra_Suresi_Dakika,COP_Kutle_kg,COP_Kesit_Alani_m2,Aksiyon
+1,2026-03-29 09:41:58.816933,Türksat-4A,63.31,KRITIK,-8.5,1.13,YAVAŞLA (ALÇALDıRıCı MANEVRA),7.52,7.4391,-0.0809,650,45,2000,15,DERHAL MANEVRA BAŞLAT
+2,2026-03-29 09:41:58.816933,Göktürk-3,73.74,UYARI,12.5,1.67,HIZLAN (YÜKSELDİRECİ MANEVRA),7.5,7.5515,0.0515,750,45,1000,10,HAZIRLIK YAPILSIN
+3,2026-03-29 09:41:58.816933,Türksat-5A,38.24,DİKKAT,45.0,6.01,GÖZ ÖNÜNDEde TUTULUYOR,7.48,7.48,0.0,700,0,500,5,RUTİN OPERASYON DEVAM

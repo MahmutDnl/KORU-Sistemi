@@ -1,0 +1,4 @@
+Senaryo_No,Senaryo_Adi,Uydu_Adi,Uydu_Orbital_Hiz_km_s,Yukseklik_Fark_km,Enlem_Fark_Derece,Boylam_Fark_Derece,COP_Kutle_kg,COP_Kesit_Alani_m2,Risk_Olasılığı_%,Risk_Sınıfı,Aciliyet_Seviyesi,Manevra_Tavsiyesi,Hiz_Degisim_km_s,Hedef_Yukseklik_km,Hedef_Hiz_km_s,Manevra_Suresi_Dakika,Timestamp
+1,SENARYO 1: KRITIK DURUM - ÇÖP YAKINDA VE ALÇAKTA,Türksat-4A,7.52,-8.5,0.05,0.08,2000,15,63.31,KRITIK,🔴 YÜKSEK,YAVAŞLA (-0.0809 km/s) → 650 km İN,-0.0809,650,7.4391,45,2026-03-29 09:41:58.804991
+2,SENARYO 2: ORTA RİSK - ÇÖP ALT TARAFINDA,Göktürk-3,7.5,12.5,0.1,0.2,1000,10,73.74,ORTA,🟡 ORTA,HIZLAN (+0.0515 km/s) → 750 km YUKARI,0.0515,750,7.5515,45,2026-03-29 09:41:58.804991
+3,SENARYO 3: DÜŞÜK RİSK - ÇÖP UZAKTA,Türksat-5A,7.48,45.0,0.5,0.8,500,5,38.24,DÜŞÜK,🟢 DÜŞÜK,GÖZ ÖNÜNDEde TUTULUYOR,0.0,700,7.48,0,2026-03-29 09:41:58.804991

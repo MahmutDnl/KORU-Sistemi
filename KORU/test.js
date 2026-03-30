@@ -1,0 +1,2014 @@
+
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
+
+    const EARTH_TEXTURE_URL = "https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg";
+    const EARTH_NIGHT_LIGHTS_URL = "https://unpkg.com/three-globe/example/img/earth-night.jpg";
+    const EARTH_BUMP_URL = "https://unpkg.com/three-globe/example/img/earth-topology.png";
+
+    // --- FİZİK SABİTLERİ VE YARDIMCI DEĞİŞKENLER ---
+    const MU_EARTH = 398600.4418; // km^3/s^2 (Dünya'nın standart kütleçekim parametresi)
+    const EARTH_RADIUS = 1;
+    const EARTH_RADIUS_KM = 6371;
+    const EARTH_SOLAR_DAY_MS = 24 * 3600 * 1000;
+    const EARTH_SOLAR_ROTATION_OFFSET_Y = Math.PI * 0.85;
+
+    let speedDataMap = {}; // uyduAdı -> { v, period }
+    let simulationTimeOffset = 0; // Saniye cinsinden zaman yolculuğu ofseti
+    let isPlaying = false;
+    let playSpeed = 60;
+    let lastFrameTime = 0;
+
+    function getUtcDayFraction() {
+      const d = new Date();
+      const dayStartUtcMs = Date.UTC(
+        d.getUTCFullYear(),
+        d.getUTCMonth(),
+        d.getUTCDate()
+      );
+      return (Date.now() - dayStartUtcMs) / EARTH_SOLAR_DAY_MS;
+    }
+
+    function getEarthSolarRotationY() {
+      // Dünya'nın rotasyonunu da seçilen zaman ofsetine göre kaydırıyoruz
+      const offsetFraction = simulationTimeOffset / (24 * 3600);
+      return (getUtcDayFraction() + offsetFraction) * Math.PI * 2 + EARTH_SOLAR_ROTATION_OFFSET_Y;
+    }
+
+    let currentFilterMode = 0;
+    let riskDataMap = {};
+    let collisionMode = false;
+    let collisionSatId = null;
+    let collisionDebrisNorad = null;
+
+    function sceneVecToEciKm(v) {
+      return { x: v.x * EARTH_RADIUS_KM, y: v.y * EARTH_RADIUS_KM, z: v.z * EARTH_RADIUS_KM };
+    }
+    function formatEciKm(eci) {
+      const f = (n) => n.toFixed(1);
+      return `x ${f(eci.x)} · y ${f(eci.y)} · z ${f(eci.z)}`;
+    }
+
+    function eciKmToSceneVec3(p) {
+      return new THREE.Vector3(
+        p.x / EARTH_RADIUS_KM,
+        p.y / EARTH_RADIUS_KM,
+        p.z / EARTH_RADIUS_KM
+      );
+    }
+
+    function latLonAltToSceneVec3(latDeg, lonDeg, altKm) {
+      const R = EARTH_RADIUS_KM + altKm;
+      const lat = (latDeg * Math.PI) / 180;
+      const lon = (lonDeg * Math.PI) / 180;
+      const x = R * Math.cos(lat) * Math.cos(lon);
+      const y = R * Math.sin(lat);
+      const z = R * Math.cos(lat) * Math.sin(lon);
+      return new THREE.Vector3(x / EARTH_RADIUS_KM, y / EARTH_RADIUS_KM, z / EARTH_RADIUS_KM);
+    }
+
+    function sceneVecToLatLonAlt(v) {
+      const len = v.length();
+      if (len < 1e-9)
+        return { latDeg: 0, lonDeg: 0, altKm: 0 };
+      const sn = THREE.MathUtils.clamp(v.y / len, -1, 1);
+      const latDeg = (Math.asin(sn) * 180) / Math.PI;
+      const lonDeg = (Math.atan2(v.z, v.x) * 180) / Math.PI;
+      const altKm = (len - EARTH_RADIUS) * EARTH_RADIUS_KM;
+      return { latDeg, lonDeg, altKm };
+    }
+
+    function formatLatLonAlt(latDeg, lonDeg, altKm, digits = 4) {
+      const f = (n) => n.toFixed(digits);
+      return `Enlem ${f(latDeg)}° · Boylam ${f(lonDeg)}° · İrtifa ${altKm.toFixed(1)} km`;
+    }
+
+    function satGeodeticSummary(sat) {
+      if (sat?.positionScene instanceof THREE.Vector3) {
+        const ll = sceneVecToLatLonAlt(sat.positionScene);
+        return formatLatLonAlt(ll.latDeg, ll.lonDeg, ll.altKm);
+      }
+      if (sat?.latDeg != null && sat?.lonDeg != null && sat?.altKm != null) {
+        return formatLatLonAlt(sat.latDeg, sat.lonDeg, sat.altKm);
+      }
+      return "—";
+    }
+
+    function satelliteLabelFacingCamera(satWorldPos, cameraPos) {
+      const a = satWorldPos.clone().normalize();
+      const b = cameraPos.clone().normalize();
+      return a.dot(b) > 0.06;
+    }
+
+    function earthOccludesSegment(camPos, satPos, radius = 1.008) {
+      const seg = satPos.clone().sub(camPos);
+      const L = seg.length();
+      if (L < 1e-9) return false;
+      const u = seg.multiplyScalar(1 / L);
+      const o = camPos;
+      const b1 = o.dot(u);
+      const c1 = o.lengthSq() - radius * radius;
+      const disc = b1 * b1 - c1;
+      if (disc < 0) return false;
+      const s = Math.sqrt(disc);
+      let t0 = -b1 - s;
+      let t1 = -b1 + s;
+      if (t0 > t1) [t0, t1] = [t1, t0];
+      const enter = Math.max(0, t0);
+      const exit = Math.min(L, t1);
+      return exit > enter;
+    }
+
+    function labelZoomCompScale(camPos, labelWorldPos) {
+      const d = camPos.distanceTo(labelWorldPos);
+      return THREE.MathUtils.clamp(Math.sqrt(1.65 / d), 0.52, 1.12);
+    }
+
+    function parseCsv(text) {
+      const lines = text.trim().split(/\r?\n/);
+      return lines.map((line) => {
+        const cols = [];
+        let c = "";
+        let q = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            q = !q;
+            continue;
+          }
+          if (!q && ch === ",") {
+            cols.push(c);
+            c = "";
+            continue;
+          }
+          c += ch;
+        }
+        cols.push(c);
+        return cols;
+      });
+    }
+
+    function inferRegime(altKm) {
+      if (altKm >= 30000) return "GEO";
+      if (altKm >= 2000) return "MEO";
+      return "LEO";
+    }
+
+    // --- FİZİK VE ÇARPIŞMA HESABI FONKSİYONLARI ---
+
+    function normalizeName(name) {
+      return String(name).toLowerCase().replace(/\s+/g, "");
+    }
+
+    async function loadSpeedData() {
+      try {
+        const res = await fetch("turk_uydulari_hiz_bilgisi.csv");
+        if (!res.ok) throw new Error(`Hız CSV yüklenemedi: ${res.status}`);
+        const rows = parseCsv(await res.text());
+
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (r.length < 4) continue;
+          const name = normalizeName(r[0]);
+          const v = parseFloat(r[2]);
+          const period = parseFloat(r[3]);
+          if (!Number.isNaN(v)) {
+            speedDataMap[name] = { v, period };
+          }
+        }
+        console.log("✅ Hız verileri yüklendi:", Object.keys(speedDataMap).length, "uydu");
+      } catch (e) {
+        console.warn("⚠️ Hız CSV yükleme hatası (yaklaşık model kullanılacak):", e);
+      }
+    }
+
+    function estimateAngularVelocity(rKm, vKmS) {
+      if (vKmS) return vKmS / rKm; // rad/s
+      return Math.sqrt(MU_EARTH / Math.pow(rKm, 3)); // 2-cisim dairesel yörünge yaklaşımı
+    }
+
+    function propagateCircularOrbitPosition(r0Km, n, omega, tSeconds) {
+      const rNorm = r0Km.length();
+      if (rNorm < 1e-6) return r0Km.clone();
+      const u = r0Km.clone().normalize();
+
+      const vDir = new THREE.Vector3().crossVectors(n, u).normalize();
+      if (vDir.lengthSq() < 1e-6) return r0Km.clone();
+
+      const angle = omega * tSeconds;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+
+      return new THREE.Vector3(
+        u.x * cosA + vDir.x * sinA,
+        u.y * cosA + vDir.y * sinA,
+        u.z * cosA + vDir.z * sinA
+      ).multiplyScalar(rNorm);
+    }
+
+    function computeClosestApproach(satId, debrisMeta) {
+      const sat = satellites.find(s => s.id === satId);
+      if (!sat) return null;
+
+      // Hesaplamayı fiziksel taban pozisyonları üzerinden yap
+      const satPosKm = sat.basePosKm;
+      const satNorm = sat.normal;
+      const satOmega = sat.omega;
+
+      const debPosKm = debrisMeta.basePosKm;
+      const debNorm = debrisMeta.normal;
+      const debOmega = debrisMeta.omega;
+
+      const speedInfo = speedDataMap[normalizeName(sat.name)];
+
+      let minApprochKm = Infinity;
+      let bestT = 0;
+      let bestSatPos = null;
+      let bestDebPos = null;
+
+      // Kullanıcının bulunduğu simülasyon zamanından (simulationTimeOffset) başlayıp 
+      // ileriye doğru 24 saat (86400 sn) tarama yap.
+      const maxTime = 24 * 3600;
+      const step = 60;
+      const startTime = simulationTimeOffset;
+      const endTime = simulationTimeOffset + maxTime;
+
+      for (let t = startTime; t <= endTime; t += step) {
+        const pS = propagateCircularOrbitPosition(satPosKm, satNorm, satOmega, t);
+        const pD = propagateCircularOrbitPosition(debPosKm, debNorm, debOmega, t);
+        const dist = pS.distanceTo(pD);
+        if (dist < minApprochKm) {
+          minApprochKm = dist;
+          bestT = t;
+          bestSatPos = pS.clone();
+          bestDebPos = pD.clone();
+        }
+      }
+
+      // Bulunan minimum etrafında 1 saniyelik ince tarama
+      const fineStart = Math.max(startTime, bestT - 60);
+      const fineEnd = Math.min(endTime, bestT + 60);
+      for (let t = fineStart; t <= fineEnd; t += 1) {
+        const pS = propagateCircularOrbitPosition(satPosKm, satNorm, satOmega, t);
+        const pD = propagateCircularOrbitPosition(debPosKm, debNorm, debOmega, t);
+        const dist = pS.distanceTo(pD);
+        if (dist < minApprochKm) {
+          minApprochKm = dist;
+          bestT = t;
+          bestSatPos = pS.clone();
+          bestDebPos = pD.clone();
+        }
+      }
+
+      return {
+        minApprochKm,
+        bestT, // Simülasyon başından itibaren mutlak saniye
+        tcaFromSimNow: bestT - simulationTimeOffset, // Şu anki simülasyon zamanından itibaren geçecek süre
+        bestSatPos,
+        bestDebPos,
+        usedVelocityFile: !!speedInfo
+      };
+    }
+
+    function computeRiskScore(minDist, crossSection, massStr) {
+      let score = 0;
+      if (minDist < 5) score += 60;
+      else if (minDist < 20) score += 40;
+      else if (minDist < 100) score += 20;
+      else if (minDist < 500) score += 5;
+
+      if (crossSection > 2) score += 20;
+      else if (crossSection > 0.5) score += 10;
+
+      let mass = parseFloat(massStr);
+      if (!Number.isNaN(mass)) {
+        if (mass > 500) score += 20;
+        else if (mass > 50) score += 10;
+      }
+
+      score = Math.min(100, score);
+
+      let rClass = "Düşük Risk";
+      let color = "var(--ok)";
+      if (score >= 60 || minDist <= 20) {
+        rClass = "Kritik Çarpışma İhtimali";
+        color = "var(--crit)";
+      } else if (score >= 30 || minDist <= 150) {
+        rClass = "Yakın Geçiş (Orta)";
+        color = "var(--warn)";
+      }
+      return { score, rClass, color };
+    }
+
+    function formatTimeTCA(tSecondsFromNow) {
+      if (tSecondsFromNow < 0) return "Geçti";
+      if (tSecondsFromNow < 60) return `${tSecondsFromNow.toFixed(0)} sn sonra`;
+      if (tSecondsFromNow < 3600) return `${(tSecondsFromNow / 60).toFixed(1)} dk sonra`;
+      return `${(tSecondsFromNow / 3600).toFixed(1)} saat sonra`;
+    }
+
+    // --- VERİ YÜKLEME VE İNŞA ---
+
+    function buildSatellitesFromTurkishCsv(rows) {
+      if (rows.length < 2) return [];
+      const out = [];
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.length < 5) continue;
+        const name = String(r[0]).trim();
+        const norad = String(r[1]).trim();
+        const lat = parseFloat(r[2]);
+        const lon = parseFloat(r[3]);
+        const alt = parseFloat(r[4]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(alt)) continue;
+        const id = `trk-${norad}`;
+
+        const riskData = riskDataMap[name] || { riskPercent: 0, riskClass: "—", urgency: "🟢 DÜŞÜK" };
+
+        const pScene = latLonAltToSceneVec3(lat, lon, alt);
+        const pKm = pScene.clone().multiplyScalar(EARTH_RADIUS_KM);
+        const basis = orbitBasisFromEciPosition(pScene) || { n: new THREE.Vector3(0, 1, 0), v: new THREE.Vector3(1, 0, 0) };
+
+        out.push({
+          id,
+          name,
+          noradId: norad,
+          latDeg: lat,
+          lonDeg: lon,
+          altKm: alt,
+          regime: inferRegime(alt),
+          mission: "Canlı konum (CSV)",
+          status: "active",
+          risk: "none",
+          collision: null,
+          hasOrbitLine: false,
+          positionScene: pScene.clone(),
+          basePosKm: pKm, // Fizik simülasyonu için 0. saniye noktası
+          normal: basis.n,
+          omega: 0, // speedData yüklendiğinde atanacak
+          riskPercent: riskData.riskPercent,
+          riskClass: riskData.riskClass,
+          urgency: riskData.urgency,
+          collisionCache: {}
+        });
+      }
+      return out;
+    }
+
+    async function loadRiskData() {
+      try {
+        const res = await fetch("risk_hizli_referans_tum_uydular.csv");
+        if (!res.ok) throw new Error(`Risk CSV yüklenemedi: ${res.status}`);
+        const rows = parseCsv(await res.text());
+
+        for (let i = 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (r.length < 5) continue;
+
+          const satName = String(r[0]).trim();
+          const riskPercent = parseFloat(r[2]);
+          const riskClass = String(r[3]).trim();
+          const aciliyet = String(r[4]).trim();
+
+          if (!riskDataMap[satName]) {
+            riskDataMap[satName] = { riskPercent, riskClass, urgency: aciliyet };
+          }
+        }
+      } catch (e) {
+        console.warn("⚠️ Risk CSV yükleme hatası:", e);
+      }
+    }
+
+    let esaDebrisCount = 0;
+    let esaDebrisPointsMesh = null;
+
+    const ORBIT_DEBRIS_PLANE_EPS_SCENE = 0.012;
+    const ORBIT_DEBRIS_ALT_BAND_SCENE = 0.015;
+
+    async function loadSatelliteData() {
+      const res = await fetch("tum_turk_uydulari_canli.csv");
+      if (!res.ok) throw new Error(`Türk uydu CSV yüklenemedi: ${res.status}`);
+      const rows = parseCsv(await res.text());
+      return buildSatellitesFromTurkishCsv(rows);
+    }
+
+    const DEBRIS_POINT_VS = `
+      uniform int uFilterMode;
+      attribute vec3 color;
+      attribute float sizeNorm;
+      varying vec3 vColor;
+      void main() {
+        vColor = color;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        float mult = mix(0.82, 1.18, sizeNorm);
+        float vz = max(-mvPosition.z, 0.25);
+        
+        float isHighlight = step(0.9, color.g); 
+        float maxClamp = mix(7.0, 20.0, isHighlight);
+        float sizeBoost = mix(1.0, 2.5, isHighlight); 
+        
+        gl_PointSize = clamp(2.15 * mult * sizeBoost * (95.0 / vz), 1.2, maxClamp);
+        
+        if (uFilterMode == 1 && isHighlight < 0.5) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        } else {
+            gl_Position = projectionMatrix * mvPosition;
+        }
+      }
+    `;
+    const DEBRIS_POINT_FS = `
+      varying vec3 vColor;
+      void main() {
+        vec2 cxy = 2.0 * gl_PointCoord - 1.0;
+        if (dot(cxy, cxy) > 1.0) discard;
+        gl_FragColor = vec4(vColor, 0.72);
+      }
+    `;
+
+    async function loadEsaDebrisPoints(debrisPointsGroup) {
+      esaDebrisPointsMesh = null;
+      clearDebrisOrbitLabels();
+      while (debrisPointsGroup.children.length) {
+        const o = debrisPointsGroup.children[0];
+        debrisPointsGroup.remove(o);
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      }
+      const res = await fetch("esa_cop_verisi_TEMIZ.csv");
+      if (!res.ok) throw new Error(`ESA çöp CSV yüklenemedi: ${res.status}`);
+      const rows = parseCsv(await res.text());
+      const rowObjs = [];
+
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.length < 7) continue;
+
+        const norad = String(r[0]).trim();
+        const rawArea = parseFloat(r[3]);
+        const lat = parseFloat(r[4]);
+        const lon = parseFloat(r[5]);
+        const alt = parseFloat(r[6]);
+
+        let massVal = parseFloat(r[2]);
+        if (Number.isNaN(massVal) && r.length > 7) {
+          massVal = parseFloat(r[7]);
+        }
+        const massStr = Number.isFinite(massVal) ? `${massVal.toFixed(2)} kg` : "Veri yok";
+
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(alt)) continue;
+
+        const crossSectionM2 = Number.isFinite(rawArea) && rawArea > 0 ? rawArea : 0.05;
+        rowObjs.push({ norad, lat, lon, alt, crossSectionM2, name: String(r[1]).replace(/^"|"$/g, ""), massStr });
+      }
+
+      if (!rowObjs.length) {
+        esaDebrisCount = 0;
+        return null;
+      }
+
+      let minR = Infinity;
+      let maxR = -Infinity;
+      for (const d of rowObjs) {
+        const rt = Math.sqrt(d.crossSectionM2);
+        minR = Math.min(minR, rt);
+        maxR = Math.max(maxR, rt);
+      }
+      const rSpan = maxR - minR || 1;
+
+      const positions = [];
+      const meta = [];
+      const sizeNorms = [];
+
+      for (const d of rowObjs) {
+        const pScene = latLonAltToSceneVec3(d.lat, d.lon, d.alt);
+        const pKm = pScene.clone().multiplyScalar(EARTH_RADIUS_KM);
+        const basis = orbitBasisFromEciPosition(pScene) || { n: new THREE.Vector3(0, 1, 0), v: new THREE.Vector3(1, 0, 0) };
+        const omega = estimateAngularVelocity(pKm.length(), null);
+
+        positions.push(pScene.x, pScene.y, pScene.z);
+        const t = (Math.sqrt(d.crossSectionM2) - minR) / rSpan;
+        sizeNorms.push(THREE.MathUtils.clamp(t, 0, 1));
+        meta.push({
+          norad: d.norad,
+          name: d.name,
+          lat: d.lat,
+          lon: d.lon,
+          alt: d.alt,
+          crossSectionM2: d.crossSectionM2,
+          massStr: d.massStr,
+          basePosKm: pKm,
+          normal: basis.n,
+          omega: omega
+        });
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geo.setAttribute("sizeNorm", new THREE.Float32BufferAttribute(sizeNorms, 1));
+      const colArr = new Float32Array(positions.length);
+      for (let i = 0; i < colArr.length; i += 3) {
+        colArr[i] = 1;
+        colArr[i + 1] = 0.55;
+        colArr[i + 2] = 0.2;
+      }
+      geo.setAttribute("color", new THREE.BufferAttribute(colArr, 3));
+
+      const mat = new THREE.ShaderMaterial({
+        uniforms: {
+          uFilterMode: { value: 0 }
+        },
+        vertexShader: DEBRIS_POINT_VS,
+        fragmentShader: DEBRIS_POINT_FS,
+        transparent: true,
+        depthWrite: false,
+      });
+
+      const pts = new THREE.Points(geo, mat);
+      pts.userData.debrisMeta = meta;
+      debrisPointsGroup.add(pts);
+      esaDebrisPointsMesh = pts;
+      esaDebrisCount = meta.length;
+      return pts;
+    }
+
+    // --- SİMÜLASYON OYNATICISI FONKSİYONLARI ---
+    function applySimulationTime(offsetSeconds) {
+      simulationTimeOffset = offsetSeconds;
+
+      const clk = document.getElementById("sim-clock");
+      if (clk) {
+        const sign = simulationTimeOffset < 0 ? "-" : "+";
+        const absOffset = Math.abs(simulationTimeOffset);
+        const h = Math.floor(absOffset / 3600);
+        const m = Math.floor((absOffset % 3600) / 60);
+        const s = Math.floor(absOffset % 60);
+        clk.textContent = `${sign} ${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      }
+
+      satellites.forEach(sat => {
+        const newPosKm = propagateCircularOrbitPosition(sat.basePosKm, sat.normal, sat.omega, simulationTimeOffset);
+        sat.positionScene.copy(newPosKm).divideScalar(EARTH_RADIUS_KM);
+      });
+
+      if (esaDebrisPointsMesh) {
+        const posAttr = esaDebrisPointsMesh.geometry.getAttribute("position");
+        const metaArr = esaDebrisPointsMesh.userData.debrisMeta;
+        for (let i = 0; i < metaArr.length; i++) {
+          if (collisionSatId && collisionDebrisNorad) {
+            if (String(metaArr[i].norad) !== String(collisionDebrisNorad)) continue;
+          }
+          const newPosKm = propagateCircularOrbitPosition(metaArr[i].basePosKm, metaArr[i].normal, metaArr[i].omega, simulationTimeOffset);
+          posAttr.setXYZ(i, newPosKm.x / EARTH_RADIUS_KM, newPosKm.y / EARTH_RADIUS_KM, newPosKm.z / EARTH_RADIUS_KM);
+        }
+        posAttr.needsUpdate = true;
+      }
+
+      syncSceneVisuals();
+
+      if (focusId && collisionMode && collisionSatId === focusId) {
+        const sat = satellites.find(s => s.id === focusId);
+        if (sat && sat.collisionCache[collisionDebrisNorad]) {
+          const dynTCA = document.getElementById("dyn-tca");
+          if (dynTCA) {
+            const approach = sat.collisionCache[collisionDebrisNorad];
+            const remaining = approach.bestT - simulationTimeOffset;
+            dynTCA.textContent = formatTimeTCA(remaining);
+          }
+        }
+      }
+    }
+
+    const btnPlayPause = document.getElementById('btn-play-pause');
+    if (btnPlayPause) {
+      btnPlayPause.addEventListener('click', () => {
+        if (!collisionMode) return;
+        isPlaying = !isPlaying;
+        if (isPlaying) lastFrameTime = performance.now();
+        btnPlayPause.innerHTML = isPlaying ? "⏸ Durdur" : "▶ Oynat";
+        btnPlayPause.style.color = isPlaying ? "#ff6b81" : "#7af0c0";
+        btnPlayPause.style.borderColor = isPlaying ? "rgba(255,107,129,0.5)" : "rgba(46, 229, 157, 0.6)";
+        btnPlayPause.style.background = isPlaying ? "rgba(255,107,129,0.15)" : "rgba(46, 229, 157, 0.2)";
+      });
+    }
+
+    const selSpeed = document.getElementById('sim-speed');
+    if (selSpeed) {
+      selSpeed.addEventListener('change', (e) => {
+        playSpeed = parseFloat(e.target.value);
+      });
+    }
+
+    const btnResetTime = document.getElementById('btn-reset-time');
+    if (btnResetTime) {
+      btnResetTime.addEventListener('click', () => {
+        isPlaying = false;
+        if (btnPlayPause) {
+          btnPlayPause.innerHTML = "▶ Oynat";
+          btnPlayPause.style.color = "#7af0c0";
+          btnPlayPause.style.borderColor = "rgba(46, 229, 157, 0.6)";
+          btnPlayPause.style.background = "rgba(46, 229, 157, 0.2)";
+        }
+        applySimulationTime(0);
+      });
+    }
+
+
+    const _debrisHlTmp = new THREE.Vector3();
+    const _lblWorldPos = new THREE.Vector3();
+
+    function updateDebrisOrbitHighlight() {
+      const mesh = esaDebrisPointsMesh;
+      const colAttr = mesh?.geometry?.getAttribute("color");
+      const posAttr = mesh?.geometry?.getAttribute("position");
+      if (!colAttr || !posAttr) return;
+
+      const sat = focusId ? satellites.find((s) => s.id === focusId) : null;
+      const showOrbit = !!(sat && orbitVisibleIds.has(focusId));
+      const n = showOrbit ? satelliteOrbitPlaneNormal(sat) : null;
+      const r0 = showOrbit ? satelliteOrbitRadiusScene(sat) : 0;
+
+      const activeNorads = new Set(satellites.map(s => String(s.noradId)));
+
+      for (let i = 0; i < colAttr.count; i++) {
+        const i3 = i * 3;
+
+        if (!showOrbit) {
+          colAttr.array[i3] = 1;
+          colAttr.array[i3 + 1] = 0.55;
+          colAttr.array[i3 + 2] = 0.2;
+          continue;
+        }
+
+        const meta = mesh.userData.debrisMeta[i];
+
+        if (activeNorads.has(String(meta.norad))) {
+          colAttr.array[i3] = 1;
+          colAttr.array[i3 + 1] = 0.55;
+          colAttr.array[i3 + 2] = 0.2;
+          continue;
+        }
+
+        _debrisHlTmp.fromBufferAttribute(posAttr, i);
+        const distPlane = Math.abs(_debrisHlTmp.dot(n));
+        const distAlt = Math.abs(_debrisHlTmp.length() - r0);
+        const onOrbit = distPlane < ORBIT_DEBRIS_PLANE_EPS_SCENE && distAlt < ORBIT_DEBRIS_ALT_BAND_SCENE;
+        if (onOrbit) {
+          colAttr.array[i3] = 1;
+          colAttr.array[i3 + 1] = 0.97;
+          colAttr.array[i3 + 2] = 0.22;
+        } else {
+          colAttr.array[i3] = 1;
+          colAttr.array[i3 + 1] = 0.55;
+          colAttr.array[i3 + 2] = 0.2;
+        }
+      }
+      colAttr.needsUpdate = true;
+      syncDebrisOrbitLabels();
+
+      lastGlobalLabelUpdate = 0;
+    }
+
+    const DEBRIS_ORBIT_LABEL_CAP = 64;
+    const debrisOrbitLabelsGroup = new THREE.Group();
+    const debrisOrbitLabelEntries = [];
+
+    function clearDebrisOrbitLabels() {
+      while (debrisOrbitLabelsGroup.children.length) {
+        debrisOrbitLabelsGroup.remove(debrisOrbitLabelsGroup.children[0]);
+      }
+      debrisOrbitLabelEntries.length = 0;
+    }
+
+    function syncDebrisOrbitLabels() {
+      clearDebrisOrbitLabels();
+      const mesh = esaDebrisPointsMesh;
+      const posAttr = mesh?.geometry?.getAttribute("position");
+      const metaArr = mesh?.userData?.debrisMeta;
+      if (!posAttr || !metaArr) return;
+
+      const sat = focusId ? satellites.find((s) => s.id === focusId) : null;
+      const showOrbit = !!(sat && orbitVisibleIds.has(focusId));
+      if (!showOrbit || !sat) return;
+
+      const n = satelliteOrbitPlaneNormal(sat);
+      const r0 = satelliteOrbitRadiusScene(sat);
+      const activeNorads = new Set(satellites.map((s) => String(s.noradId)));
+      const satObj = satObjects.get(sat.id);
+      const currentSatPos = satObj
+        ? satObj.group.position.clone()
+        : sat.positionScene
+          ? sat.positionScene.clone()
+          : new THREE.Vector3();
+
+      const candidates = [];
+      for (let i = 0; i < posAttr.count; i++) {
+        const meta = metaArr[i];
+        if (activeNorads.has(String(meta.norad))) continue;
+        _debrisHlTmp.fromBufferAttribute(posAttr, i);
+        const distPlane = Math.abs(_debrisHlTmp.dot(n));
+        const distAlt = Math.abs(_debrisHlTmp.length() - r0);
+        const onOrbit = distPlane < ORBIT_DEBRIS_PLANE_EPS_SCENE && distAlt < ORBIT_DEBRIS_ALT_BAND_SCENE;
+        if (!onOrbit) continue;
+        candidates.push({
+          pos: _debrisHlTmp.clone(),
+          dist: currentSatPos.distanceTo(_debrisHlTmp),
+          meta,
+        });
+      }
+      candidates.sort((a, b) => a.dist - b.dist);
+      const pick = candidates.slice(0, DEBRIS_ORBIT_LABEL_CAP);
+
+      for (const c of pick) {
+        const wrap = document.createElement("div");
+        wrap.className = "sat-label-wrap";
+        const inner = document.createElement("div");
+        inner.className = "sat-label-inner";
+        const el = document.createElement("div");
+        el.className = "debris-orbit-label";
+        const name = String(c.meta.name || "Çöp").trim() || "Çöp";
+        const nameLine = document.createElement("span");
+        nameLine.textContent = name.length > 40 ? `${name.slice(0, 38)}…` : name;
+        const sub = document.createElement("span");
+        sub.className = "debris-orbit-label__sub";
+        const ll = sceneVecToLatLonAlt(c.pos);
+        sub.innerHTML = `NORAD ${c.meta.norad}<br/><span style="font-size:0.85em;color:rgba(255,255,255,0.65)">${ll.latDeg.toFixed(2)}°, ${ll.lonDeg.toFixed(2)}°</span>`;
+        el.appendChild(nameLine);
+        el.appendChild(sub);
+        inner.appendChild(el);
+        wrap.appendChild(inner);
+        const lbl = new CSS2DObject(wrap);
+        lbl.renderOrder = 18;
+        const lift = 0.055;
+        lbl.position.copy(c.pos).addScaledVector(c.pos.clone().normalize(), lift);
+        debrisOrbitLabelsGroup.add(lbl);
+        debrisOrbitLabelEntries.push({ label: lbl, labelInner: inner, basePos: c.pos.clone() });
+      }
+    }
+
+    function renderNearbyDebris(sat) {
+      const listContainer = document.getElementById("nearby-debris-list");
+      if (!listContainer) return;
+      listContainer.innerHTML = "";
+
+      if (!sat || !esaDebrisPointsMesh || !esaDebrisPointsMesh.userData.debrisMeta) {
+        listContainer.innerHTML = `<div style="font-size: 0.8rem; color: var(--muted); padding: 0.5rem; text-align: center;">Uydu seçildiğinde çöpler burada listelenecek.</div>`;
+        return;
+      }
+
+      const mesh = esaDebrisPointsMesh;
+      const posAttr = mesh.geometry.getAttribute("position");
+      const metaArray = mesh.userData.debrisMeta;
+
+      const n = satelliteOrbitPlaneNormal(sat);
+      const r0 = satelliteOrbitRadiusScene(sat);
+
+      const nearbyDebris = [];
+      const activeNorads = new Set(satellites.map(s => String(s.noradId)));
+
+      for (let i = 0; i < posAttr.count; i++) {
+        const meta = metaArray[i];
+        if (activeNorads.has(String(meta.norad))) continue;
+
+        _debrisHlTmp.fromBufferAttribute(posAttr, i);
+        const distPlane = Math.abs(_debrisHlTmp.dot(n));
+        const distAlt = Math.abs(_debrisHlTmp.length() - r0);
+        const onOrbit = distPlane < ORBIT_DEBRIS_PLANE_EPS_SCENE && distAlt < ORBIT_DEBRIS_ALT_BAND_SCENE;
+
+        if (onOrbit) {
+          nearbyDebris.push({ meta });
+        }
+      }
+
+      for (let item of nearbyDebris) {
+        if (!sat.collisionCache[item.meta.norad]) {
+          sat.collisionCache[item.meta.norad] = computeClosestApproach(sat.id, item.meta);
+        }
+        item.approach = sat.collisionCache[item.meta.norad];
+      }
+
+      nearbyDebris.sort((a, b) => a.approach.minApprochKm - b.approach.minApprochKm);
+
+      if (nearbyDebris.length === 0) {
+        listContainer.innerHTML = `<div style="font-size: 0.8rem; color: var(--muted); padding: 0.5rem; text-align: center;">Bu yörüngede yakın çöp bulunamadı.</div>`;
+        return;
+      }
+
+      const displayLimit = 50;
+      const topDebris = nearbyDebris.slice(0, displayLimit);
+
+      for (const item of topDebris) {
+        const card = document.createElement("div");
+        card.className = "debris-card";
+        card.style.marginBottom = "0.5rem";
+        card.style.display = "block";
+
+        const approach = item.approach;
+        const approachRisk = computeRiskScore(approach.minApprochKm, item.meta.crossSectionM2, item.meta.massStr);
+        const riskColor = approachRisk.color;
+        const tcaStr = formatTimeTCA(approach.tcaFromSimNow); // Gösterilen simülasyon zamanından itibaren
+
+        card.innerHTML = `
+          <strong style="color: #fff; font-size: 0.85rem;">${item.meta.name || "Bilinmeyen Çöp"}</strong>
+          <span style="float:right; font-weight: bold; color: ${riskColor}; font-size: 0.8rem;">Min: ${approach.minApprochKm.toFixed(1)} km</span>
+          <dl class="debris-row" style="margin-top: 0.5rem;">
+            <dt>NORAD ID</dt><dd>${item.meta.norad}</dd>
+            <dt>Yaklaşma Zm.</dt><dd style="color: var(--accent);">${tcaStr}</dd>
+            <dt>Risk Sınıfı</dt><dd style="color: ${riskColor};">${approachRisk.rClass} (${approachRisk.score.toFixed(0)} Pts)</dd>
+            <dt>İrtifa</dt><dd>${item.meta.alt.toFixed(1)} km</dd>
+            <dt>Kesit / Kütle</dt><dd>${item.meta.crossSectionM2.toFixed(4)} m² / ${item.meta.massStr}</dd>
+          </dl>
+        `;
+
+        const btnCollision = document.createElement("button");
+        btnCollision.className = "btn-collision";
+        btnCollision.textContent = "Çarpışmayı Göster";
+        btnCollision.addEventListener("click", () => {
+          startCollisionMode(sat.id, item.meta.norad);
+        });
+
+        card.appendChild(btnCollision);
+        listContainer.appendChild(card);
+      }
+
+      if (nearbyDebris.length > displayLimit) {
+        const note = document.createElement("div");
+        note.style.fontSize = "0.75rem";
+        note.style.color = "var(--muted)";
+        note.style.textAlign = "center";
+        note.style.marginTop = "0.5rem";
+        note.style.marginBottom = "0.5rem";
+        note.textContent = `Toplam ${nearbyDebris.length} çöp tespit edildi. En riskli ${displayLimit} tanesi listelendi.`;
+        listContainer.appendChild(note);
+      }
+    }
+
+    function createCSSLabel(title, colorHex, subText = "") {
+      const wrap = document.createElement("div");
+      wrap.className = "sat-label-wrap";
+      const inner = document.createElement("div");
+      inner.className = "sat-label-inner";
+      const el = document.createElement("div");
+      el.className = "debris-orbit-label";
+      el.style.borderColor = "#" + colorHex.toString(16).padStart(6, '0');
+      el.style.background = "rgba(20, 10, 10, 0.85)";
+      el.style.zIndex = "100";
+
+      const titleSpan = document.createElement("span");
+      titleSpan.style.color = "#" + colorHex.toString(16).padStart(6, '0');
+      titleSpan.style.fontWeight = "bold";
+      titleSpan.textContent = title;
+      el.appendChild(titleSpan);
+
+      if (subText) {
+        const sub = document.createElement("span");
+        sub.className = "debris-orbit-label__sub";
+        sub.textContent = subText;
+        el.appendChild(sub);
+      }
+
+      inner.appendChild(el);
+      wrap.appendChild(inner);
+      return new CSS2DObject(wrap);
+    }
+
+    function buildCollisionMarkers(approach) {
+      while (collisionVizGroup.children.length) collisionVizGroup.remove(collisionVizGroup.children[0]);
+
+      const pS_scene = eciKmToSceneVec3(approach.bestSatPos);
+      const pD_scene = eciKmToSceneVec3(approach.bestDebPos);
+
+      // Kırmızı marker (Uydu)
+      const matS = new THREE.MeshBasicMaterial({ color: 0xff4466 });
+      const meshS = new THREE.Mesh(new THREE.SphereGeometry(0.015, 16, 16), matS);
+      meshS.position.copy(pS_scene);
+      collisionVizGroup.add(meshS);
+
+      // Turuncu marker (Çöp)
+      const matD = new THREE.MeshBasicMaterial({ color: 0xffb020 });
+      const meshD = new THREE.Mesh(new THREE.SphereGeometry(0.012, 16, 16), matD);
+      meshD.position.copy(pD_scene);
+      collisionVizGroup.add(meshD);
+
+      // Aradaki kesikli bağlantı çizgisi
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([pS_scene, pD_scene]);
+      const lineMat = new THREE.LineDashedMaterial({
+        color: 0xffffff,
+        dashSize: 0.015,
+        gapSize: 0.015,
+        transparent: true,
+        opacity: 0.8
+      });
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.computeLineDistances();
+      collisionVizGroup.add(line);
+
+      // CSS2D Etiketler
+      const lblS = createCSSLabel("Uydu Kritik Nokta", 0xff4466);
+      lblS.position.copy(pS_scene).addScaledVector(pS_scene.clone().normalize(), 0.05);
+      collisionVizGroup.add(lblS);
+
+      const lblD = createCSSLabel("Çöp Yaklaşma Nkt.", 0xffb020, `Min Mesafe: ${approach.minApprochKm.toFixed(1)} km`);
+      lblD.position.copy(pD_scene).addScaledVector(pD_scene.clone().normalize(), 0.07);
+      collisionVizGroup.add(lblD);
+
+      // Kamerayı bu noktaya odakla
+      const center = new THREE.Vector3().addVectors(pS_scene, pD_scene).multiplyScalar(0.5);
+      cameraAutoMove = true;
+      desiredCameraPos.copy(center).normalize().multiplyScalar(camera.position.length() * 0.7);
+      controls.target.copy(center);
+    }
+
+    function startCollisionMode(satId, debrisNorad) {
+      collisionMode = true;
+      collisionSatId = satId;
+      collisionDebrisNorad = debrisNorad;
+
+      const sat = satellites.find(s => s.id === satId);
+      if (!sat) return;
+
+      // Hata güvenliği için: Eğer bir nedenden ötürü cache silinmişse, anında tekrar hesapla.
+      let approach = sat.collisionCache[debrisNorad];
+      if (!approach) {
+        const metaArr = esaDebrisPointsMesh?.userData?.debrisMeta;
+        const meta = metaArr?.find(m => String(m.norad) === String(debrisNorad));
+        if (meta) {
+          approach = computeClosestApproach(sat.id, meta);
+          sat.collisionCache[debrisNorad] = approach;
+        } else {
+          return; // Meta veri bulunamadıysa modu durdur
+        }
+      }
+
+      buildCollisionMarkers(approach);
+
+      const banner = document.getElementById("collision-mode-banner");
+      const details = document.getElementById("collision-details");
+      if (banner && details) {
+        banner.style.display = "block";
+        const rScore = computeRiskScore(approach.minApprochKm, 1, "0");
+
+        const pS_scene = eciKmToSceneVec3(approach.bestSatPos);
+        const pD_scene = eciKmToSceneVec3(approach.bestDebPos);
+        const satLL = sceneVecToLatLonAlt(pS_scene);
+        const debLL = sceneVecToLatLonAlt(pD_scene);
+
+        details.innerHTML = `
+          <strong>NORAD ID:</strong> ${debrisNorad}<br/>
+          <strong>Min Yaklaşma:</strong> <span style="color:${rScore.color}; font-weight:bold;">${approach.minApprochKm.toFixed(2)} km</span><br/>
+          <strong>Simülasyondan İtibaren Zm.:</strong> <span id="dyn-tca">${formatTimeTCA(approach.tcaFromSimNow)}</span><br/>
+          <strong>Uydu Kritik Nokta:</strong> ${satLL.latDeg.toFixed(3)}°, ${satLL.lonDeg.toFixed(3)}° · ${satLL.altKm.toFixed(0)} km<br/>
+          <strong>Çöp Yaklaşma Nkt.:</strong> ${debLL.latDeg.toFixed(3)}°, ${debLL.lonDeg.toFixed(3)}° · ${debLL.altKm.toFixed(0)} km<br/>
+          <strong>Risk Durumu:</strong> ${rScore.rClass}<br/>
+          <span style="color:var(--muted); font-size:0.65rem;">
+          Model: ${approach.usedVelocityFile ? "Gerçek Hız + Dairesel Propagasyon" : "Yaklaşık Dairesel Propagasyon"}
+          </span>
+        `;
+      }
+
+      syncSceneVisuals();
+      updateSatelliteListButtons();
+
+      const player = document.getElementById('collision-player');
+      if (player) player.style.display = 'flex';
+
+      const camPanel = document.getElementById("cam-panel");
+      const camText = document.getElementById("cam-recommendation-text");
+      if (camPanel && camText) {
+        camPanel.style.display = "block";
+        if (approach.minApprochKm > 100 && rScore.score < 30) {
+          camPanel.style.borderColor = "rgba(46, 229, 157, 0.5)";
+          camPanel.querySelector('div').style.color = "#2ee59d";
+          camText.innerHTML = `Mevcut yörünge izi güvenli görülmektedir.<br/><strong>İşlem:</strong> Çarpışmadan kaçınma manevrası (CAM) gereksinimi yoktur.`;
+        } else {
+          camPanel.style.borderColor = "rgba(255, 107, 129, 0.5)";
+          camPanel.querySelector('div').style.color = "#ff6b81";
+
+          const isGeo = satLL.altKm > 20000;
+          const safeMargin = isGeo ? 50 : 15;
+          let neededDist = safeMargin - approach.minApprochKm;
+          if (neededDist <= 0) neededDist = 5;
+
+          const deltaVPerKm = isGeo ? 0.02 : 0.05;
+          const deltaV = neededDist * deltaVPerKm;
+
+          camText.innerHTML = `<strong>Durum:</strong> Kritik Görev Riski!<br/><br/><strong>Tavsiye Edilen Eylem:</strong> Çarpışmayı önlemek ve min. ${safeMargin} km teğet geçiş aralığı bırakmak için uydunun irtifasını <strong>+${neededDist.toFixed(1)} km</strong> yönde artıracak eksenel ateşleme (Manevra) yapılması gerekmektedir.<br/><br/><strong style="color:var(--accent);">Tahmini Yakıt Harcaması (ΔV): ~${deltaV.toFixed(2)} m/s</strong>`;
+        }
+      }
+    }
+
+    function endCollisionMode() {
+      collisionMode = false;
+      collisionSatId = null;
+      collisionDebrisNorad = null;
+
+      setCollisionVisualization(null);
+
+      const banner = document.getElementById("collision-mode-banner");
+      if (banner) banner.style.display = "none";
+
+      const camPanel = document.getElementById("cam-panel");
+      if (camPanel) camPanel.style.display = "none";
+
+      const player = document.getElementById('collision-player');
+      if (player) player.style.display = 'none';
+      isPlaying = false;
+      const bp = document.getElementById('btn-play-pause');
+      if (bp) {
+        bp.innerHTML = "▶ Oynat";
+        bp.style.color = "#7af0c0";
+        bp.style.borderColor = "rgba(46, 229, 157, 0.6)";
+        bp.style.background = "rgba(46, 229, 157, 0.2)";
+      }
+      applySimulationTime(0);
+
+      syncSceneVisuals();
+      updateSatelliteListButtons();
+
+      if (focusId) {
+        const sel = satObjects.get(focusId);
+        if (sel) {
+          cameraAutoMove = true;
+          const outward = sel.group.position.clone().normalize();
+          desiredCameraPos.copy(sel.group.position).add(outward.multiplyScalar(0.35));
+        }
+      }
+    }
+
+    function orbitBasisFromEciPosition(eciScene) {
+      const p = eciScene.clone();
+      const r = p.length();
+      if (r < 1e-6) return null;
+      const u_r = p.clone().normalize();
+      const north = new THREE.Vector3(0, 1, 0);
+      let u_east = new THREE.Vector3().crossVectors(north, u_r);
+      if (u_east.lengthSq() < 1e-10) {
+        u_east.set(1, 0, 0);
+      } else {
+        u_east.normalize();
+      }
+      const n = new THREE.Vector3().crossVectors(u_east, u_r).normalize();
+      return { r, u_r, n };
+    }
+
+    function satelliteOrbitRadiusScene(sat) {
+      if (sat.positionScene instanceof THREE.Vector3) {
+        return sat.positionScene.length();
+      }
+      return EARTH_RADIUS + 0.06;
+    }
+
+    function satelliteOrbitPlaneNormal(sat) {
+      if (sat.normal instanceof THREE.Vector3) return sat.normal.clone();
+      return new THREE.Vector3(0, 1, 0);
+    }
+
+    const container = document.getElementById("canvas-container");
+    const satListEl = document.getElementById("sat-list");
+    const rightSatName = document.getElementById("right-sat-name");
+    const statusCard = document.getElementById("status-card");
+    const statusMsg = document.getElementById("status-msg");
+    const rightRiskInfo = document.getElementById("right-risk-info");
+    const btnExitCollision = document.getElementById("btn-exit-collision");
+
+    btnExitCollision.addEventListener("click", () => {
+      endCollisionMode();
+    });
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+    camera.position.set(0, 0.45, 2.85);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.12;
+
+    const labelRenderer = new CSS2DRenderer();
+    labelRenderer.setSize(1, 1);
+    labelRenderer.domElement.className = "css2d-layer";
+    labelRenderer.domElement.style.position = "absolute";
+    labelRenderer.domElement.style.left = "0";
+    labelRenderer.domElement.style.top = "0";
+    labelRenderer.domElement.style.pointerEvents = "none";
+    labelRenderer.domElement.style.zIndex = "1";
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 1.45;
+    controls.maxDistance = 14;
+    controls.autoRotate = false;
+
+    let cameraAutoMove = false;
+    const desiredCameraPos = new THREE.Vector3();
+    controls.addEventListener('start', () => { cameraAutoMove = false; });
+
+    const globalDebrisLabelsGroup = new THREE.Group();
+    scene.add(globalDebrisLabelsGroup);
+    const globalDebrisLabelPool = [];
+    let lastGlobalLabelUpdate = 0;
+    const GLOBAL_LABEL_CAP = 40;
+
+    for (let i = 0; i < GLOBAL_LABEL_CAP; i++) {
+      const wrap = document.createElement("div");
+      wrap.className = "sat-label-wrap";
+      const inner = document.createElement("div");
+      inner.className = "sat-label-inner";
+      const el = document.createElement("div");
+      el.className = "debris-orbit-label";
+      el.style.borderColor = "rgba(180, 180, 180, 0.35)";
+      el.style.background = "rgba(20, 24, 32, 0.6)";
+
+      const nameLine = document.createElement("span");
+      const sub = document.createElement("span");
+      sub.className = "debris-orbit-label__sub";
+
+      el.appendChild(nameLine);
+      el.appendChild(sub);
+      inner.appendChild(el);
+      wrap.appendChild(inner);
+
+      const lbl = new CSS2DObject(wrap);
+      lbl.renderOrder = 15;
+      lbl.visible = false;
+      globalDebrisLabelsGroup.add(lbl);
+
+      globalDebrisLabelPool.push({
+        lbl, inner, nameLine, sub, active: false, basePos: new THREE.Vector3()
+      });
+    }
+
+    document.querySelectorAll('input[name="view-filter"]').forEach(radio => {
+      radio.addEventListener('change', (e) => {
+        currentFilterMode = parseInt(e.target.value);
+
+        if (esaDebrisPointsMesh && esaDebrisPointsMesh.material.uniforms) {
+          esaDebrisPointsMesh.material.uniforms.uFilterMode.value = currentFilterMode;
+        }
+
+        const showSats = (currentFilterMode === 0 || currentFilterMode === 1);
+        satGroup.visible = showSats;
+        orbitLinesGroup.visible = showSats;
+
+        if (currentFilterMode === 2 && focusId) {
+          orbitVisibleIds.delete(focusId);
+          focusId = null;
+          cameraAutoMove = true;
+          const dist = Math.max(camera.position.length(), 2.85);
+          desiredCameraPos.copy(camera.position).normalize().multiplyScalar(dist);
+          syncSceneVisuals();
+          updateSatelliteListButtons();
+          setCollisionVisualization(null);
+          clearRightPanel();
+        }
+        lastGlobalLabelUpdate = 0;
+        syncSceneVisuals(); // Filtre değişiminde anında görünüm güncelle
+      });
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const pointerNdc = new THREE.Vector2();
+    let pointerDown = null;
+
+    const ambient = new THREE.AmbientLight(0x1a2238, 0.32);
+    scene.add(ambient);
+
+    const SUN_DISTANCE = 18;
+    const sunDirection = new THREE.Vector3(1, 0.1, 0.15).normalize();
+    const sun = new THREE.DirectionalLight(0xfff5e8, 2.35);
+    sun.position.copy(sunDirection).multiplyScalar(SUN_DISTANCE);
+    scene.add(sun);
+    sun.target.position.set(0, 0, 0);
+    scene.add(sun.target);
+
+    const rim = new THREE.DirectionalLight(0x335588, 0.35);
+    rim.position.set(-3.5, -0.8, -2.5);
+    scene.add(rim);
+
+    const textureLoader = new THREE.TextureLoader();
+    textureLoader.setCrossOrigin("anonymous");
+
+    let earthTexture = null;
+    let earthNightTexture = null;
+    let earthBumpTexture = null;
+
+    try {
+      earthTexture = await new Promise((resolve, reject) => {
+        textureLoader.load(
+          EARTH_TEXTURE_URL,
+          (tex) => {
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            resolve(tex);
+          },
+          undefined,
+          reject
+        );
+      });
+    } catch (e) {
+      console.warn("Dünya dokusu yüklenemedi:", e);
+    }
+
+    try {
+      earthNightTexture = await new Promise((resolve, reject) => {
+        textureLoader.load(
+          EARTH_NIGHT_LIGHTS_URL,
+          (tex) => {
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            resolve(tex);
+          },
+          undefined,
+          reject
+        );
+      });
+    } catch (e) {
+      console.warn("Gece ışıkları dokusu yüklenemedi:", e);
+    }
+
+    try {
+      earthBumpTexture = await new Promise((resolve, reject) => {
+        textureLoader.load(
+          EARTH_BUMP_URL,
+          (tex) => {
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            resolve(tex);
+          },
+          undefined,
+          reject
+        );
+      });
+    } catch (e) {
+      console.warn("Bump dokusu yüklenemedi:", e);
+    }
+
+    const earthFrame = new THREE.Group();
+    scene.add(earthFrame);
+
+    const earthMatOpts = {
+      map: earthTexture,
+      metalness: 0.1,
+      roughness: 0.72,
+    };
+
+    if (earthBumpTexture) {
+      earthMatOpts.bumpMap = earthBumpTexture;
+      earthMatOpts.bumpScale = 0.015;
+    }
+
+    if (earthNightTexture) {
+      earthMatOpts.emissiveMap = earthNightTexture;
+      earthMatOpts.emissive = new THREE.Color(0xffffff);
+      earthMatOpts.emissiveIntensity = 0.68;
+    } else {
+      earthMatOpts.emissive = new THREE.Color(0x001830);
+      earthMatOpts.emissiveIntensity = 0.22;
+    }
+    const earthMat = new THREE.MeshStandardMaterial(earthMatOpts);
+
+    const earth = new THREE.Mesh(new THREE.SphereGeometry(EARTH_RADIUS, 64, 64), earthMat);
+    earthFrame.add(earth);
+
+    const sunCanvas = document.createElement('canvas');
+    sunCanvas.width = 512;
+    sunCanvas.height = 512;
+    const sunCtx = sunCanvas.getContext('2d');
+    const sunGrad = sunCtx.createRadialGradient(256, 256, 0, 256, 256, 256);
+    sunGrad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    sunGrad.addColorStop(0.05, 'rgba(255, 245, 215, 1)');
+    sunGrad.addColorStop(0.2, 'rgba(255, 200, 80, 0.8)');
+    sunGrad.addColorStop(0.5, 'rgba(200, 80, 0, 0.3)');
+    sunGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    sunCtx.fillStyle = sunGrad;
+    sunCtx.fillRect(0, 0, 512, 512);
+
+    const sunTex = new THREE.CanvasTexture(sunCanvas);
+    const sunSpriteMat = new THREE.SpriteMaterial({
+      map: sunTex,
+      blending: THREE.AdditiveBlending,
+      transparent: true,
+      depthWrite: false
+    });
+    const sunSprite = new THREE.Sprite(sunSpriteMat);
+    sunSprite.scale.set(28, 28, 1);
+    sunSprite.position.copy(sun.position);
+    scene.add(sunSprite);
+
+    const sunCoreGeo = new THREE.SphereGeometry(0.35, 32, 32);
+    const sunCoreMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const sunCore = new THREE.Mesh(sunCoreGeo, sunCoreMat);
+    sunCore.position.copy(sun.position);
+    scene.add(sunCore);
+
+    const atmosphere = new THREE.Mesh(
+      new THREE.SphereGeometry(1.02, 48, 48),
+      new THREE.MeshBasicMaterial({
+        color: 0x3399ff,
+        transparent: true,
+        opacity: 0.07,
+        side: THREE.BackSide,
+        depthWrite: false,
+      })
+    );
+    earthFrame.add(atmosphere);
+
+    const satObjects = new Map();
+    const satGroup = new THREE.Group();
+    scene.add(satGroup);
+
+    const orbitLinesGroup = new THREE.Group();
+    scene.add(orbitLinesGroup);
+
+    const collisionVizGroup = new THREE.Group();
+    scene.add(collisionVizGroup);
+
+    const debrisPointsGroup = new THREE.Group();
+    scene.add(debrisPointsGroup);
+    scene.add(debrisOrbitLabelsGroup);
+
+    const orbitVisibleIds = new Set();
+    let focusId = null;
+
+    function makeSatelliteMesh() {
+      const g = new THREE.SphereGeometry(0.035, 16, 16);
+      const m = new THREE.MeshStandardMaterial({
+        color: 0x44ccff,
+        emissive: 0x113355,
+        emissiveIntensity: 0.4,
+        metalness: 0.3,
+        roughness: 0.4,
+      });
+      return new THREE.Mesh(g, m);
+    }
+
+    function makeSatelliteHitMesh(satId) {
+      const g = new THREE.SphereGeometry(0.12, 12, 12);
+      const m = new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(g, m);
+      mesh.userData.satId = satId;
+      return mesh;
+    }
+
+    function makeSelectionRing() {
+      const geo = new THREE.RingGeometry(0.052, 0.092, 48);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xaaddff,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      const ring = new THREE.Mesh(geo, mat);
+      ring.renderOrder = 10;
+      ring.visible = false;
+      return ring;
+    }
+
+    function disposeOrbitLines() {
+      while (orbitLinesGroup.children.length) {
+        const o = orbitLinesGroup.children[0];
+        orbitLinesGroup.remove(o);
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      }
+    }
+
+    function buildSceneFromData(satellites) {
+      satObjects.clear();
+      while (satGroup.children.length) satGroup.remove(satGroup.children[0]);
+      disposeOrbitLines();
+
+      for (const sat of satellites) {
+        const group = new THREE.Group();
+        const mesh = makeSatelliteMesh();
+        mesh.userData.satId = sat.id;
+        const hitMesh = makeSatelliteHitMesh(sat.id);
+        const ring = makeSelectionRing();
+        const labelWrap = document.createElement("div");
+        labelWrap.className = "sat-label-wrap";
+        const labelInner = document.createElement("div");
+        labelInner.className = "sat-label-inner";
+        const labelEl = document.createElement("div");
+        labelEl.className = "sat-label";
+        labelEl.textContent = sat.name;
+        labelInner.appendChild(labelEl);
+        labelWrap.appendChild(labelInner);
+        const label = new CSS2DObject(labelWrap);
+        label.position.set(0, 0, 0);
+        label.renderOrder = 20;
+        group.add(mesh);
+        group.add(hitMesh);
+        group.add(ring);
+        group.add(label);
+
+        // Simülasyon zamanı = 0 olarak ayarlanıyor
+        group.position.copy(sat.positionScene);
+
+        satGroup.add(group);
+
+        let orbitLine = null;
+        let loopPts = [];
+
+        // Yörünge çizgisi her zaman fiziksel olarak çiziliyor
+        for (let i = 0; i <= 192; i++) {
+          const ph = (i / 192) * Math.PI * 2;
+          const u = sat.basePosKm.clone().normalize();
+          const vDir = new THREE.Vector3().crossVectors(sat.normal, u).normalize();
+          const r = sat.basePosKm.length();
+          const pt = new THREE.Vector3(
+            u.x * Math.cos(ph) + vDir.x * Math.sin(ph),
+            u.y * Math.cos(ph) + vDir.y * Math.sin(ph),
+            u.z * Math.cos(ph) + vDir.z * Math.sin(ph)
+          ).multiplyScalar(r / EARTH_RADIUS_KM);
+          loopPts.push(pt);
+        }
+
+        if (loopPts.length) {
+          const orbitGeo = new THREE.BufferGeometry().setFromPoints(loopPts);
+          const orbitMat = new THREE.LineBasicMaterial({
+            color: 0x4488cc,
+            transparent: true,
+            opacity: 0.35,
+          });
+          orbitLine = new THREE.LineLoop(orbitGeo, orbitMat);
+          orbitLinesGroup.add(orbitLine);
+        }
+
+        satObjects.set(sat.id, {
+          group,
+          mesh,
+          hitMesh,
+          ring,
+          orbitLine,
+          label,
+          labelInner,
+          labelEl,
+          sat,
+        });
+      }
+    }
+
+    function setCollisionVisualization(sat) {
+      while (collisionVizGroup.children.length) {
+        const o = collisionVizGroup.children[0];
+        collisionVizGroup.remove(o);
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      }
+    }
+
+    let satellites = [];
+
+    function riskBadge(risk) {
+      if (risk === "critical") return '<span class="badge badge--crit">KRİTİK</span>';
+      if (risk === "warning") return '<span class="badge badge--warn">UYARI</span>';
+      return '';
+    }
+
+    function statusLabelTr(sat) {
+      if (sat.status === "planned") return "Planlanan görev";
+      if (sat.status === "inactive") return "Görev sonu / pasif";
+      return "Aktif";
+    }
+
+    function clearRightPanel() {
+      rightSatName.textContent = "Uydu seçin";
+      rightRiskInfo.innerHTML = "";
+      renderNearbyDebris(null);
+    }
+
+    function syncSceneVisuals() {
+      for (const [sid, obj] of satObjects) {
+        let isFocused = false;
+
+        if (collisionMode) {
+          isFocused = (sid === collisionSatId);
+        } else {
+          isFocused = orbitVisibleIds.has(sid);
+        }
+
+        // --- DÜZELTME: Uydu küreleri filtre "sadece çöpler" değilse HER ZAMAN görünür ---
+        const showSatellite = (currentFilterMode !== 2);
+
+        obj.group.visible = showSatellite;
+
+        // Etiketlerin de varsayılan olarak açık olmasını sağladık
+        if (showSatellite) {
+          obj.label.visible = true;
+        }
+
+        if (obj.labelEl) {
+          obj.labelEl.classList.toggle("sat-label--focus", sid === focusId);
+        }
+
+        // Yörünge çizgisi sadece uyduya tıklandığında görünür olsun
+        if (obj.orbitLine) {
+          obj.orbitLine.visible = (showSatellite && isFocused);
+          if (obj.orbitLine.visible) {
+            const mat = obj.orbitLine.material;
+            mat.opacity = (sid === focusId) ? 0.85 : 0.45;
+            mat.color.setHex((sid === focusId) ? 0x66aaff : 0x4488cc);
+          }
+        }
+
+        // Tıklama halkası sadece uyduya tıklandığında görünür olsun
+        obj.ring.visible = (showSatellite && isFocused);
+        if (!isFocused) {
+          obj.ring.material.opacity = 0;
+        }
+      }
+
+      if (collisionMode && esaDebrisPointsMesh) {
+        const colAttr = esaDebrisPointsMesh.geometry?.getAttribute("color");
+        const posAttr = esaDebrisPointsMesh.geometry?.getAttribute("position");
+        const metaArr = esaDebrisPointsMesh.userData?.debrisMeta;
+
+        if (colAttr && posAttr && metaArr) {
+          for (let i = 0; i < colAttr.count; i++) {
+            const i3 = i * 3;
+            const meta = metaArr[i];
+
+            if (String(meta.norad) === String(collisionDebrisNorad)) {
+              colAttr.array[i3] = 1;
+              colAttr.array[i3 + 1] = 0.97;
+              colAttr.array[i3 + 2] = 0.22;
+            } else {
+              colAttr.array[i3] = 0.2;
+              colAttr.array[i3 + 1] = 0.2;
+              colAttr.array[i3 + 2] = 0.2;
+            }
+          }
+          colAttr.needsUpdate = true;
+        }
+        clearDebrisOrbitLabels();
+        for (let i = 0; i < globalDebrisLabelPool.length; i++) {
+          globalDebrisLabelPool[i].lbl.visible = false;
+        }
+      } else {
+        updateDebrisOrbitHighlight();
+      }
+    }
+
+    function updateSatelliteListButtons() {
+      document.querySelectorAll(".sat-btn").forEach((btn) => {
+        const id = btn.dataset.id;
+        btn.classList.toggle("sat-btn--orbit", orbitVisibleIds.has(id));
+        btn.classList.toggle("is-active", focusId === id);
+        btn.classList.toggle("collision-locked", collisionMode);
+      });
+    }
+
+    function toggleOrbitFromLeft(id) {
+      if (collisionMode) return;
+
+      if (orbitVisibleIds.has(id)) {
+        orbitVisibleIds.delete(id);
+        if (focusId === id) {
+          focusId = null;
+          cameraAutoMove = true;
+          const dist = Math.max(camera.position.length(), 2.85);
+          desiredCameraPos.copy(camera.position).normalize().multiplyScalar(dist);
+        }
+      } else {
+        orbitVisibleIds.add(id);
+        focusId = id;
+        cameraAutoMove = true;
+      }
+      syncSceneVisuals();
+      const sat = focusId ? satellites.find((s) => s.id === focusId) : null;
+      if (sat) {
+        updateRightPanel(sat);
+        setCollisionVisualization(sat);
+      } else {
+        clearRightPanel();
+        setCollisionVisualization(null);
+      }
+      updateSatelliteListButtons();
+    }
+
+    function focusFrom3D(id) {
+      if (collisionMode) return;
+
+      orbitVisibleIds.add(id);
+      focusId = id;
+      cameraAutoMove = true;
+      syncSceneVisuals();
+      const sat = satellites.find((s) => s.id === id);
+      if (sat) {
+        setCollisionVisualization(sat);
+        updateRightPanel(sat);
+      }
+      updateSatelliteListButtons();
+    }
+
+    function updateRightPanel(sat) {
+      rightSatName.textContent = sat.name;
+      rightRiskInfo.innerHTML = "";
+
+      if (sat.riskPercent > 0 || sat.riskClass !== "—") {
+        const riskDiv = document.createElement("div");
+        riskDiv.className = "status-card";
+        riskDiv.classList.add("status-card--warn");
+        riskDiv.innerHTML = `
+          <div class="status-card__label">📊 Risk Analizi</div>
+          <div class="status-card__msg">
+            <strong>Risk Yüzdesi:</strong> ${sat.riskPercent.toFixed(2)}%<br/>
+            <strong>Risk Sınıfı:</strong> ${sat.riskClass}<br/>
+            <strong>Aciliyet:</strong> ${sat.urgency}
+          </div>
+        `;
+        rightRiskInfo.appendChild(riskDiv);
+      }
+
+      renderNearbyDebris(sat);
+    }
+
+    function renderSatelliteList(list) {
+      satListEl.innerHTML = "";
+      for (const sat of list) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "sat-item-wrapper";
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "sat-btn";
+        btn.dataset.id = sat.id;
+
+        let riskBadgeHtml = "";
+        if (sat.status === "planned") {
+          riskBadgeHtml = '<span class="badge badge--warn">Plan</span>';
+        } else if (sat.status === "inactive") {
+          riskBadgeHtml = '<span class="badge badge--ok">Pasif</span>';
+        } else if (sat.risk === "critical") {
+          riskBadgeHtml = '<span class="badge badge--crit">KRİTİK</span>';
+        } else if (sat.risk === "warning") {
+          riskBadgeHtml = '<span class="badge badge--warn">UYARI</span>';
+        }
+
+        const posSub = sat.latDeg != null
+          ? `${sat.latDeg.toFixed(3)}°, ${sat.lonDeg.toFixed(3)}° · ${sat.altKm.toFixed(0)} km`
+          : "";
+
+        let urgencyClass = "sat-btn__urgency--low";
+        if (sat.urgency && sat.urgency.includes("YÜKSEK")) urgencyClass = "sat-btn__urgency--high";
+        else if (sat.urgency && sat.urgency.includes("ORTA")) urgencyClass = "sat-btn__urgency--medium";
+
+        btn.innerHTML = `${sat.name}${riskBadgeHtml}<span class="sat-btn__urgency ${urgencyClass}">${sat.urgency || "—"}</span><span class="sat-btn__sub">${posSub} · NORAD ${sat.noradId}</span>`;
+        btn.addEventListener("click", () => toggleOrbitFromLeft(sat.id));
+
+        const detailBtn = document.createElement("button");
+        detailBtn.className = "sat-btn-detail";
+        detailBtn.textContent = "Detaylandır";
+
+        const detailPanel = document.createElement("dl");
+        detailPanel.className = "sat-details info-box";
+        detailPanel.innerHTML = `
+          <dt>Görev / rejim</dt>
+          <dd>${sat.mission} · ${sat.regime}</dd>
+          <dt>NORAD ID</dt>
+          <dd>${sat.noradId}</dd>
+          <dt>Durum</dt>
+          <dd>${statusLabelTr(sat)}</dd>
+          <dt>Konum</dt>
+          <dd class="eci-line" id="left-pos-${sat.id}">${satGeodeticSummary(sat)}</dd>
+        `;
+
+        if (sat.riskPercent > 0 || sat.riskClass !== "—") {
+          const riskDiv = document.createElement("div");
+          riskDiv.className = "risk-info";
+          riskDiv.innerHTML = `<strong>📊 Risk Analizi:</strong><br/>Risk: ${sat.riskPercent.toFixed(2)}% · Sınıf: ${sat.riskClass}<br/>Aciliyet: ${sat.urgency}`;
+          detailPanel.appendChild(riskDiv);
+        }
+
+        detailBtn.addEventListener("click", () => {
+          detailPanel.classList.toggle("is-open");
+          detailBtn.textContent = detailPanel.classList.contains("is-open") ? "Gizle" : "Detaylandır";
+        });
+
+        wrapper.appendChild(btn);
+        wrapper.appendChild(detailBtn);
+        wrapper.appendChild(detailPanel);
+        satListEl.appendChild(wrapper);
+      }
+      updateSatelliteListButtons();
+    }
+
+    function fitCameraToContainer() {
+      const w = container.clientWidth || 1;
+      const h = container.clientHeight || 1;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      labelRenderer.setSize(w, h);
+    }
+
+    const ro = new ResizeObserver(() => fitCameraToContainer());
+    ro.observe(container);
+    container.appendChild(renderer.domElement);
+    container.appendChild(labelRenderer.domElement);
+    fitCameraToContainer();
+
+    function pickSatelliteMeshes() {
+      return [...satObjects.values()].map((o) => o.hitMesh);
+    }
+
+    function ndcFromEvent(e, rect) {
+      pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      return pointerNdc;
+    }
+
+    renderer.domElement.addEventListener("pointerdown", (e) => {
+      pointerDown = { x: e.clientX, y: e.clientY };
+    });
+    renderer.domElement.addEventListener("pointerup", (e) => {
+      if (!pointerDown) return;
+      const dx = e.clientX - pointerDown.x;
+      const dy = e.clientY - pointerDown.y;
+      pointerDown = null;
+      if (dx * dx + dy * dy > 64) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      ndcFromEvent(e, rect);
+      raycaster.setFromCamera(pointerNdc, camera);
+
+      if (currentFilterMode === 2 || collisionMode) return;
+
+      const hits = raycaster.intersectObjects(pickSatelliteMeshes(), false);
+
+      if (hits.length) {
+        const id = hits[0].object.userData.satId;
+        if (!id) return;
+        if (focusId === id && orbitVisibleIds.has(id)) {
+          orbitVisibleIds.delete(id);
+          focusId = null;
+          cameraAutoMove = true;
+
+          const dist = Math.max(camera.position.length(), 2.85);
+          desiredCameraPos.copy(camera.position).normalize().multiplyScalar(dist);
+
+          syncSceneVisuals();
+          updateSatelliteListButtons();
+          setCollisionVisualization(null);
+          clearRightPanel();
+        } else focusFrom3D(id);
+      } else {
+        if (focusId) {
+          focusId = null;
+          orbitVisibleIds.clear();
+          cameraAutoMove = true;
+
+          const dist = Math.max(camera.position.length(), 2.85);
+          desiredCameraPos.copy(camera.position).normalize().multiplyScalar(dist);
+
+          syncSceneVisuals();
+          updateSatelliteListButtons();
+          setCollisionVisualization(null);
+          clearRightPanel();
+        }
+      }
+    });
+    renderer.domElement.addEventListener("pointermove", (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      ndcFromEvent(e, rect);
+      raycaster.setFromCamera(pointerNdc, camera);
+
+      if (currentFilterMode === 2 || collisionMode) {
+        renderer.domElement.style.cursor = "grab";
+        return;
+      }
+
+      const hits = raycaster.intersectObjects(pickSatelliteMeshes(), false);
+      renderer.domElement.style.cursor = hits.length ? "pointer" : "grab";
+    });
+    renderer.domElement.addEventListener("pointerleave", () => {
+      renderer.domElement.style.cursor = "grab";
+    });
+
+    try {
+      await loadSpeedData();
+      await loadRiskData();
+      satellites = await loadSatelliteData();
+      try {
+        await loadEsaDebrisPoints(debrisPointsGroup);
+      } catch (e) {
+        console.warn("ESA çöp CSV:", e);
+        esaDebrisCount = 0;
+      }
+
+      // Hız datasından omegaları ayarla
+      satellites.forEach(sat => {
+        const speedInfo = speedDataMap[normalizeName(sat.name)];
+        sat.omega = estimateAngularVelocity(sat.basePosKm.length(), speedInfo ? speedInfo.v : null);
+      });
+
+      buildSceneFromData(satellites);
+      orbitVisibleIds.clear();
+      focusId = null;
+      syncSceneVisuals();
+      clearRightPanel();
+      setCollisionVisualization(null);
+      renderSatelliteList(satellites);
+    } catch (err) {
+      console.error(err);
+      satellites = [];
+    }
+
+    function animate(t) {
+      requestAnimationFrame(animate);
+
+      if (isPlaying) {
+        const dt = (t - lastFrameTime) / 1000;
+        lastFrameTime = t;
+        let newOffset = simulationTimeOffset + (dt * playSpeed);
+
+        if (collisionMode && collisionSatId && collisionDebrisNorad) {
+          const sat = satellites.find(s => s.id === collisionSatId);
+          if (sat && sat.collisionCache[collisionDebrisNorad]) {
+            const approach = sat.collisionCache[collisionDebrisNorad];
+            if (newOffset >= approach.bestT) {
+              newOffset = approach.bestT;
+              isPlaying = false;
+              const bp = document.getElementById('btn-play-pause');
+              if (bp) {
+                bp.innerHTML = "▶ Oynat";
+                bp.style.color = "#7af0c0";
+                bp.style.borderColor = "rgba(46, 229, 157, 0.6)";
+                bp.style.background = "rgba(46, 229, 157, 0.2)";
+              }
+            }
+          }
+        } else {
+          if (newOffset > 86400) {
+            newOffset = 86400;
+            isPlaying = false;
+          }
+        }
+        applySimulationTime(newOffset);
+      } else {
+        lastFrameTime = t;
+      }
+
+      for (const sat of satellites) {
+        const obj = satObjects.get(sat.id);
+        if (!obj) continue;
+
+        // Simülasyon zamanı uydunun statik pozisyonunu belirler. 
+        obj.group.position.copy(sat.positionScene);
+        const outward = obj.group.position.clone().normalize();
+        obj.ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), outward);
+
+        // --- DÜZELTME: && obj.label.visible ŞARTI BURADAN KALDIRILDI ---
+        if (obj.label && currentFilterMode !== 2) {
+          obj.label.position.copy(outward.clone().multiplyScalar(0.1));
+          obj.label.getWorldPosition(_lblWorldPos);
+
+          const faceCam =
+            satelliteLabelFacingCamera(obj.group.position, camera.position) &&
+            !earthOccludesSegment(camera.position, obj.group.position);
+
+          obj.label.visible = faceCam;
+
+          if (faceCam && obj.labelInner) {
+            const z = labelZoomCompScale(camera.position, _lblWorldPos);
+            obj.labelInner.style.transform = `scale(${z})`;
+          }
+        } else if (obj.label) {
+          obj.label.visible = false;
+        }
+      }
+
+      if (t - lastGlobalLabelUpdate > 500) {
+        lastGlobalLabelUpdate = t;
+
+        if (!focusId && (currentFilterMode === 0 || currentFilterMode === 2) && esaDebrisPointsMesh && !collisionMode) {
+          const posAttr = esaDebrisPointsMesh.geometry.getAttribute("position");
+          const metaArr = esaDebrisPointsMesh.userData.debrisMeta;
+          const camPos = camera.position;
+          const activeNorads = new Set(satellites.map(s => String(s.noradId)));
+
+          const candidates = [];
+          for (let i = 0; i < posAttr.count; i++) {
+            const meta = metaArr[i];
+            if (activeNorads.has(String(meta.norad))) continue;
+
+            _debrisHlTmp.fromBufferAttribute(posAttr, i);
+            if (earthOccludesSegment(camPos, _debrisHlTmp)) continue;
+
+            const distSq = camPos.distanceToSquared(_debrisHlTmp);
+            candidates.push({ distSq, meta, pos: _debrisHlTmp.clone() });
+          }
+
+          candidates.sort((a, b) => a.distSq - b.distSq);
+          const pick = candidates.slice(0, GLOBAL_LABEL_CAP);
+
+          for (let i = 0; i < globalDebrisLabelPool.length; i++) {
+            const p = globalDebrisLabelPool[i];
+            if (i < pick.length) {
+              const c = pick[i];
+              p.basePos.copy(c.pos);
+              const name = String(c.meta.name || "Çöp").trim() || "Çöp";
+              p.nameLine.textContent = name.length > 30 ? `${name.slice(0, 28)}…` : name;
+              p.sub.textContent = `NORAD ${c.meta.norad}`;
+
+              const lift = 0.055;
+              p.lbl.position.copy(c.pos).addScaledVector(c.pos.clone().normalize(), lift);
+              p.lbl.visible = true;
+              p.active = true;
+            } else {
+              p.lbl.visible = false;
+              p.active = false;
+            }
+          }
+        } else {
+          for (let i = 0; i < globalDebrisLabelPool.length; i++) {
+            globalDebrisLabelPool[i].lbl.visible = false;
+            globalDebrisLabelPool[i].active = false;
+          }
+        }
+      }
+
+      for (let i = 0; i < globalDebrisLabelPool.length; i++) {
+        const p = globalDebrisLabelPool[i];
+        if (p.active && p.lbl.visible) {
+          p.lbl.getWorldPosition(_lblWorldPos);
+          const faceCam = satelliteLabelFacingCamera(p.basePos, camera.position) && !earthOccludesSegment(camera.position, p.basePos);
+          p.lbl.visible = faceCam;
+          if (faceCam) {
+            p.inner.style.transform = `scale(${labelZoomCompScale(camera.position, _lblWorldPos)})`;
+          }
+        }
+      }
+
+      for (const de of debrisOrbitLabelEntries) {
+        const bp = de.basePos;
+        const lift = 0.055;
+        de.label.position.copy(bp).addScaledVector(bp.clone().normalize(), lift);
+        de.label.getWorldPosition(_lblWorldPos);
+        const faceCam =
+          satelliteLabelFacingCamera(bp, camera.position) &&
+          !earthOccludesSegment(camera.position, bp);
+        de.label.visible = faceCam;
+        if (faceCam && de.labelInner) {
+          de.labelInner.style.transform = `scale(${labelZoomCompScale(camera.position, _lblWorldPos)})`;
+        }
+      }
+
+      // Dünya rotasyonu da atlanılan saate ayak uydurur!
+      earthFrame.rotation.y = getEarthSolarRotationY();
+
+      let targetCenter = new THREE.Vector3(0, 0, 0);
+
+      if (focusId && !collisionMode) {
+        const sel = satObjects.get(focusId);
+        if (sel) {
+          targetCenter.copy(sel.group.position);
+          controls.minDistance = 0.08;
+
+          if (cameraAutoMove) {
+            const outward = sel.group.position.clone().normalize();
+            desiredCameraPos.copy(sel.group.position).add(outward.multiplyScalar(0.35));
+          }
+        }
+      } else if (!collisionMode) {
+        controls.minDistance = 1.45;
+      }
+
+      if (!collisionMode) {
+        controls.target.lerp(targetCenter, 0.08);
+      }
+
+      if (cameraAutoMove) {
+        camera.position.lerp(desiredCameraPos, 0.05);
+        if (camera.position.distanceTo(desiredCameraPos) < 0.02) {
+          cameraAutoMove = false;
+        }
+      }
+
+      if (focusId) {
+        const sel = satObjects.get(focusId);
+        if (sel?.ring.visible) {
+          const pulse = 0.22 + 0.48 * (0.5 + 0.5 * Math.sin(t * 0.004));
+          sel.ring.material.opacity = pulse;
+        }
+        if (sel?.sat) {
+          const posText = satGeodeticSummary(sel.sat);
+          const leftPosEl = document.getElementById(`left-pos-${sel.sat.id}`);
+          if (leftPosEl) leftPosEl.textContent = posText;
+        }
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+      labelRenderer.render(scene, camera);
+    }
+    requestAnimationFrame(animate);
+  
